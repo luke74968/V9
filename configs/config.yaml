@@ -1,0 +1,42 @@
+# config.yaml
+
+# [신규] 학습 하이퍼파라미터 (메모리 OOM 방지 및 POMO 설정)
+batch_size: 8         # [중요] 물리적 배치 크기 (작게 설정)
+pomo_size: 24         # [중요] POMO 샘플링 개수 (16 ~ 100)
+use_amp: True
+
+# 모델 파라미터
+model_params:
+   N_MAX: 500
+   embedding_dim: 256
+   encoder_layer_num: 6
+   decoder_layer_num: 3
+   qkv_dim: 16
+   head_num: 16
+   ff_hidden_dim: 512
+   ffd: 'siglu'
+   norm_type: 'rms'
+   logit_clipping: 50
+
+
+# 옵티마이저 및 스케줄러 파라미터
+optimizer_params:
+    optimizer:
+        lr: 5e-6
+        weight_decay: 1e-6
+    max_grad_norm: 1.0        
+    scheduler:
+        name: 'MultiStepLR'
+        milestones: [80, 95]
+        gamma: 0.1
+
+# 트레이너 파라미터
+trainer_params:
+    epochs: 200
+    train_step: 100  # 1 에폭당 훈련 스텝 수
+    model_save_interval: 5
+    gradient_accumulation_steps: 1 # [추가] 4(Batch) * 32(Accum) = 128 (논리적 배치 효과)
+    model_load:
+        enable: False
+        path: 'transformer_solver/result/...'
+        epoch: 100

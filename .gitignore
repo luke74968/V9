@@ -1,0 +1,30 @@
+# 가상환경
+venv/
+.env/
+.venv/
+env/
+ENV/
+
+# 파이썬 캐시 파일 무시
+__pycache__/
+*.pyc
+*.py[cod]
+*$py.class
+
+# png 무시
+*.png
+
+# text 무시
+.txt 
+
+#log.txt
+result_transformer/
+result_or_tools/
+validation_data/
+
+#zip
+*.7z
+*.zip
+
+#상세 주석 추가버전 코드 무시 
+*_annotation.py
