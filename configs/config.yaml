@@ -1,7 +1,7 @@
 # config.yaml
 
 # [신규] 학습 하이퍼파라미터 (메모리 OOM 방지 및 POMO 설정)
-batch_size: 8         # [중요] 물리적 배치 크기 (작게 설정)
+batch_size: 1        # [중요] 물리적 배치 크기 (작게 설정)
 pomo_size: 24         # [중요] POMO 샘플링 개수 (16 ~ 100)
 use_amp: True
 
