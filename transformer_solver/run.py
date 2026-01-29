@@ -23,6 +23,8 @@ if torch.cuda.is_available() and torch.cuda.get_device_capability(0)[0] >= 8:
 
 # --- 핵심 모듈 임포트 ---
 # (이 파일들은 우리가 방금/앞으로 만들 파일들입니다)
+from common.config_loader import load_configuration_from_file
+from common.ic_preprocessor import expand_ic_templates, prune_dominated_ics
 from .model import PocatModel
 from .solver_env import PocatEnv
 from .trainer import PocatTrainer
@@ -59,6 +61,10 @@ def main(args):
     args.local_rank = int(os.environ.get('LOCAL_RANK', -1))
     args.world_size = int(os.environ.get('WORLD_SIZE', 1))
     args.ddp = args.world_size > 1
+    if args.test_only and args.test_json:
+        if not os.path.exists(args.config_file):
+            print(f"ℹ️ Config file '{args.config_file}' not found. Auto-switching to '{args.test_json}'")
+            args.config_file = args.test_json
 
     if args.ddp:
         dist.init_process_group(backend='nccl')
@@ -116,7 +122,26 @@ def main(args):
 
     if args.test_only:
         if args.local_rank <= 0: # 테스트는 0번 프로세스에서만
-            trainer.test()
+            if getattr(args, 'test_json', None):
+                args.log(f"🔍 Loading custom test JSON: {args.test_json}")
+                
+                # 1. 원본 JSON 데이터 로드 (문제 정의)
+                with open(args.test_json, 'r', encoding='utf-8') as f:
+                    problem_data = json.load(f)
+                
+                if isinstance(problem_data, dict):
+                    problem_data = [problem_data]
+
+                # [수정] 불필요한 재계산 제거. Generator 내부의 템플릿 사용 (ic_list=None)
+                custom_test_data = trainer.env.generator.preprocess_to_tensordict(
+                    problem_data, 
+                    ic_list=None, 
+                    device=device
+                )
+                
+                trainer.test(test_data_override=custom_test_data)
+            else:
+                trainer.test()
     else:
         trainer.run() # 훈련 (DDP/단일 모드 모두 실행)
     
@@ -144,6 +169,7 @@ if __name__ == "__main__":
     # --- 추론(Test) / 모델 로드 ---
     parser.add_argument('--test_only', action='store_true', help="Only run test/inference")
     parser.add_argument('--load_path', type=str, default=None, help="Path to a saved model checkpoint (.pth)")
+    parser.add_argument('--test_json', type=str, default=None, help="Path to a specific JSON problem file for testing")
     parser.add_argument("--test_num_pomo_samples", type=int, default=None, 
                         help="Number of POMO samples for testing. (Defaults to num_pomo_samples)")
     parser.add_argument('--decode_type', type=str, default='greedy', choices=['greedy', 'sampling'],

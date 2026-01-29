@@ -716,3 +716,118 @@ class PocatGenerator:
             "connectivity_matrix": torch.stack(batch_adj_list).to(device),
             "attention_mask": torch.stack(batch_mask_list).to(device),
         }, batch_size=[batch_size])
+
+    def preprocess_to_tensordict(self, problem_data: List[Dict[str, Any]], ic_list: List[Any] = None, device='cpu') -> TensorDict:
+        """
+        [테스트용] JSON으로 로드된 문제 데이터(List of Dict)를 모델 입력용 TensorDict로 변환합니다.
+        
+        Args:
+            problem_data: 문제 정의 리스트 (각 요소는 'loads', 'battery' 등을 포함한 dict)
+            ic_list: (사용 안 함) API 호환성을 위해 유지 (내부 config의 템플릿 사용)
+            device: 텐서 디바이스
+        """
+        batch_size = len(problem_data)
+        batch_nodes_list = []
+        batch_scalar_prompt = []
+        batch_matrix_prompt = []
+        batch_adj_list = []
+        batch_mask_list = []
+
+        # 1. IC 템플릿 피처 가져오기 (학습 시점과 동일한 순서/스펙 보장)
+        # self._base_tensors는 [Battery, ConfigLoads, Templates, Empty] 순서임.
+        template_start_idx = 1 + self.num_loads
+        template_end_idx = template_start_idx + self.num_templates
+        master_ic_features = self._base_tensors["nodes"][template_start_idx:template_end_idx].clone().to(device)
+
+        # 2. Battery 피처 템플릿 (기본값)
+        batt_feat_template = torch.zeros(1, FEATURE_DIM, device=device)
+        batt_feat_template[0, FEATURE_INDEX["node_type"][0] + NODE_TYPE_BATTERY] = 1.0
+        batt_feat_template[0, FEATURE_INDEX["is_active"]] = 1.0
+        batt_feat_template[0, FEATURE_INDEX["vout_min"]] = self.config.battery["voltage_min"]
+        batt_feat_template[0, FEATURE_INDEX["vout_max"]] = self.config.battery["voltage_max"]
+
+        for i, problem in enumerate(problem_data):
+            # --- Load 피처 생성 ---
+            loads_data = problem.get("loads", [])
+            num_current_loads = len(loads_data)
+            
+            if 1 + num_current_loads + self.num_templates > self.N_max:
+                raise ValueError(f"Problem {i} has too many loads ({num_current_loads}) for N_max={self.N_max}")
+
+            loads_feat = torch.zeros(num_current_loads, FEATURE_DIM, device=device)
+            
+            # Power Sequence 매핑을 위한 이름->인덱스 맵
+            node_name_map = { "Battery": 0, self.config.battery.get("name", "Battery"): 0 }
+
+            for k, l_conf in enumerate(loads_data):
+                loads_feat[k, FEATURE_INDEX["node_type"][0] + NODE_TYPE_LOAD] = 1.0
+                loads_feat[k, FEATURE_INDEX["is_active"]] = 1.0
+                
+                # 전압/전류 요구사항 매핑
+                v_typ = l_conf.get("voltage_typical", 0.0)
+                loads_feat[k, FEATURE_INDEX["vin_min"]] = v_typ
+                loads_feat[k, FEATURE_INDEX["vin_max"]] = v_typ
+                loads_feat[k, FEATURE_INDEX["vout_min"]] = v_typ
+                
+                loads_feat[k, FEATURE_INDEX["current_active"]] = l_conf.get("current_active", 0.0)
+                loads_feat[k, FEATURE_INDEX["current_sleep"]] = l_conf.get("current_sleep", 0.0)
+                
+                rail_type = l_conf.get("independent_rail_type")
+                if rail_type == "exclusive_supplier":
+                    loads_feat[k, FEATURE_INDEX["independent_rail_type"]] = 1.0
+                elif rail_type == "exclusive_path":
+                    loads_feat[k, FEATURE_INDEX["independent_rail_type"]] = 2.0
+                
+                if l_conf.get("always_on_in_sleep", False):
+                    loads_feat[k, FEATURE_INDEX["always_on_in_sleep"]] = 1.0
+                
+                node_name_map[l_conf["name"]] = 1 + k
+
+            # --- Battery 정보 업데이트 (JSON에 있다면) ---
+            current_batt_feat = batt_feat_template.clone()
+            if "battery" in problem:
+                b_data = problem["battery"]
+                current_batt_feat[0, FEATURE_INDEX["vout_min"]] = b_data.get("voltage_min", 12.0)
+                current_batt_feat[0, FEATURE_INDEX["vout_max"]] = b_data.get("voltage_max", 12.0)
+
+            # --- Empty Slot 피처 ---
+            curr_cnt = 1 + num_current_loads + self.num_templates
+            num_empty = self.N_max - curr_cnt
+            empty_feat = torch.zeros(num_empty, FEATURE_DIM, device=device)
+            if num_empty > 0:
+                empty_feat[:, FEATURE_INDEX["node_type"][0] + NODE_TYPE_EMPTY] = 1.0
+                empty_feat[:, FEATURE_INDEX["can_spawn_into"]] = 1.0
+
+            # --- 전체 노드 결합 (Batt + Loads + Templates + Empty) ---
+            full_nodes = torch.cat([current_batt_feat, loads_feat, master_ic_features, empty_feat], dim=0)
+            full_nodes[:, FEATURE_INDEX["node_id"]] = torch.arange(self.N_max, device=device).float() / self.N_max
+
+            # --- 프롬프트 및 마스크 생성 ---
+            cons = problem.get("constraints", self.config.constraints)
+            scalar_p = torch.tensor([
+                cons.get("ambient_temperature", 25.0),
+                cons.get("max_sleep_current", 0.0),
+                cons.get("current_margin", 0.0),
+                cons.get("thermal_margin_deg", 0.0)
+            ], device=device)
+
+            mat_p = torch.zeros(self.N_max, self.N_max, device=device)
+            if "power_sequences" in cons:
+                for seq in cons["power_sequences"]:
+                    j, k = seq.get('j'), seq.get('k')
+                    if j in node_name_map and k in node_name_map:
+                        mat_p[node_name_map[j], node_name_map[k]] = 1.0
+
+            batch_nodes_list.append(full_nodes)
+            batch_scalar_prompt.append(scalar_p)
+            batch_matrix_prompt.append(mat_p)
+            batch_adj_list.append(self._create_connectivity_matrix(full_nodes))
+            batch_mask_list.append(self._create_attention_mask(full_nodes))
+
+        return TensorDict({
+            "nodes": torch.stack(batch_nodes_list),
+            "scalar_prompt_features": torch.stack(batch_scalar_prompt),
+            "matrix_prompt_features": torch.stack(batch_matrix_prompt),
+            "connectivity_matrix": torch.stack(batch_adj_list),
+            "attention_mask": torch.stack(batch_mask_list),
+        }, batch_size=[batch_size])

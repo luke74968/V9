@@ -508,75 +508,79 @@ class PocatTrainer:
         self.model.eval()
         
         total_instances = dataset_td.shape[0]
-        batch_size = 16 # 평가 배치 크기
+        batch_size = 16 
         
         total_bom_cost = 0.0
-        total_sleep_penalty = 0.0  # [추가] 암전류 페널티 합계
-        total_fail_penalty = 0.0   # [추가] 실패 페널티 합계
-        total_feasible_count = 0   # [추가] 성공(Feasible)한 케이스 수
+        total_sleep_current = 0.0 # 이름 변경: Penalty -> Current (실제 값이므로)
+        total_feasible_count = 0
         
         num_batches = (total_instances + batch_size - 1) // batch_size
         
-        for i in range(num_batches):
+        iterator = range(num_batches)
+        if desc:
+            try:
+                from tqdm import tqdm
+                iterator = tqdm(iterator, desc=desc, dynamic_ncols=True)
+            except ImportError:
+                pass
+        
+        for i in iterator:
             start_idx = i * batch_size
             end_idx = min((i + 1) * batch_size, total_instances)
             current_batch_size = end_idx - start_idx
             
-            # ... (배치 로드 및 모델 실행 코드는 기존과 동일) ...
+            # [1] 배치 로드 및 환경 초기화
+            raw_batch = dataset_td[start_idx:end_idx]
+            batch_td = self.env.reset(init_td=raw_batch).to(self.device)
             
-            # --- 결과 분석 (상세 리워드 집계) ---
-            # out["log_reward_..."] shape: (Batch * POMO, 1) -> (Batch, POMO)
-            # 우리는 Greedy 평가이므로 POMO 중 가장 좋은 것(Max Reward)을 선택해야 함
+            # [2] 모델 실행
+            with autocast(device_type='cuda', enabled=self.use_amp):
+                out = self.model(
+                    batch_td, 
+                    self.env, 
+                    decode_type='greedy',
+                    return_final_td=False
+                )
             
-            # 1. 전체 리워드 기준 Best 인덱스 찾기
+            # [3] 결과 분석
+            # (Batch * POMO, 1) -> (Batch, POMO) 변환
             total_reward = out["reward"].view(current_batch_size, -1)
-            best_values, best_indices = total_reward.max(dim=1) # (Batch,)
             
-            # 2. 각 상세 리워드 가져오기
-            # log_reward_bom: (Batch, POMO)
-            r_bom = out["log_reward_bom"].view(current_batch_size, -1)
-            r_sleep = out["log_reward_sleep"].view(current_batch_size, -1)
-            r_fail = out["log_reward_fail"].view(current_batch_size, -1)
+            # POMO 중 가장 높은 보상을 받은 궤적(Best Trajectory) 선택
+            best_values, best_indices = total_reward.max(dim=1)
             
-            # 3. Best 인덱스에 해당하는 값만 추출 (gather)
-            # (Batch, 1)
+            # --- [수정] 모델의 실제 출력 키(bom_cost, sleep_cost) 사용 ---
+            # V9 모델은 실제 값(Cost)을 반환하므로 바로 가져옵니다.
+            cost_bom = out["bom_cost"].view(current_batch_size, -1)
+            cost_sleep = out["sleep_cost"].view(current_batch_size, -1)
+            
+            # Best 인덱스에 해당하는 Cost 추출 (gather)
             best_indices_unsqueezed = best_indices.unsqueeze(-1)
+            best_bom = cost_bom.gather(1, best_indices_unsqueezed).squeeze(-1)
+            best_sleep = cost_sleep.gather(1, best_indices_unsqueezed).squeeze(-1)
             
-            best_r_bom = r_bom.gather(1, best_indices_unsqueezed).squeeze(-1)
-            best_r_sleep = r_sleep.gather(1, best_indices_unsqueezed).squeeze(-1)
-            best_r_fail = r_fail.gather(1, best_indices_unsqueezed).squeeze(-1)
+            # 통계 합산 (Cost는 양수이므로 그대로 더함)
+            total_bom_cost += best_bom.sum().item()
+            total_sleep_current += best_sleep.sum().item()
             
-            # 4. 점수를 원래 단위(Cost)로 변환 (음수 -> 양수)
-            # (BOM은 Scale 100이 곱해져 있으니 다시 나눌지는 선택사항이나, 여기선 점수 그대로 봄)
-            # 사용자가 원하는 건 '$' 단위일 수 있으므로 WEIGHT_BOM으로 나누는 게 정확함?
-            # 일단 리워드 값 자체를 절대값으로 더함
-            
-            total_bom_cost += (-best_r_bom).sum().item()
-            total_sleep_penalty += (-best_r_sleep).sum().item()
-            total_fail_penalty += (-best_r_fail).sum().item()
-            
-            # 성공 여부 (실패 페널티가 없으면 성공)
-            # FAILURE_PENALTY = -20000.0 이므로, 이것보다 크면(0에 가까우면) 성공
-            is_feasible = (best_r_fail > -10000.0)
+            # 성공 여부 판별 
+            # (실패 시 페널티가 -20000.0 이하로 떨어지므로, -10000.0 보다 크면 Feasible로 간주)
+            is_feasible = (best_values > -10000.0)
             total_feasible_count += is_feasible.sum().item()
             
         # 평균 계산
         avg_bom = total_bom_cost / total_instances
-        avg_sleep = total_sleep_penalty / total_instances
-        avg_fail = total_fail_penalty / total_instances
+        avg_sleep = total_sleep_current / total_instances
         feasibility_rate = total_feasible_count / total_instances
         
-        # 총 Cost (단순 합산)
-        avg_total_cost = avg_bom + avg_sleep + avg_fail
-        
+        # 로그 출력용 딕셔너리 반환
         return {
-            "avg_total_cost": avg_total_cost,
             "avg_bom": avg_bom,
             "avg_sleep": avg_sleep,
-            "avg_fail": avg_fail,
-            "feasibility": feasibility_rate
+            "feasibility": feasibility_rate,
+            # 편의상 합산 비용을 total_cost로 표기 (단위가 다를 수 있음 주의)
+            "avg_total_cost": avg_bom + avg_sleep 
         }
-
 
     @torch.no_grad()
     def evaluate(self, epoch: int):
@@ -619,16 +623,83 @@ class PocatTrainer:
             
         return metrics
 
-    def test(self):
+    def test(self, test_data_override=None):
         """ 
         [최종 실험] Clean / Crisis 테스트 데이터셋(1000개)에 대한 정량 평가 수행 
-        (generate_final_test.py로 생성된 데이터가 있어야 함)
+        (또는 사용자가 지정한 JSON 파일 테스트)
         """
         self.model.eval()
         self.log("=" * 60)
         self.log("🔬 최종 테스트 (Final Test) 시작...")
+
+        # [케이스 1] 사용자가 지정한 커스텀 JSON 데이터 테스트
+        if test_data_override is not None:
+            self.log("🚀 Testing with custom provided data (from JSON)...")
+            
+            # 1. 전체 데이터셋에 대한 정량 평가 (Metrics 계산)
+            res = self.validate_on_dataset(test_data_override, desc="Custom-JSON-Test")
+            self.log(f"   📊 [Summary] Avg BOM ${res['avg_bom']:.4f} | Feas: {res['feasibility']*100:.1f}%")
+            
+            # 2. [추가] 첫 번째 문제에 대한 상세 로그 및 시각화 수행
+            self.log("-" * 60)
+            self.log("🔎 Running Detailed Visualization for the first custom case...")
+            
+            # (1) 첫 번째 샘플 추출 및 환경 리셋
+            # 배치 크기가 1인 TensorDict로 만들어서 전달
+            single_case_td = test_data_override[:1].clone().to(self.device)
+            td = self.env.reset(init_td=single_case_td)
+            
+            # (2) 모델 실행 (log_mode='detail' 활성화)
+            with autocast(device_type='cuda', enabled=self.use_amp):
+                out = self.model(
+                    td, self.env,
+                    decode_type=self.args.decode_type, # 실행 인자(greedy/sampling) 따름
+                    log_fn=self.log,
+                    log_idx=0,
+                    log_mode='detail',   # 👈 핵심: 상세 로그 출력 활성화
+                    return_final_td=True # 👈 핵심: 시각화용 최종 상태 반환
+                )
+            
+            # (3) 시각화를 위한 정보 추출
+            # POMO 결과 중 가장 Reward가 높은(Cost가 낮은) 궤적 선택
+            reward = out['reward']
+            best_idx = reward.argmax()
+            final_cost = -reward[best_idx].item()
+            
+            # 최종 상태 TensorDict 추출
+            final_td_all = out["final_td"]
+            final_td_instance = final_td_all[best_idx] # (N_max, D)
+            
+            # 시작 노드 이름 찾기
+            num_starts, start_nodes_idx = self.env.select_start_nodes(td)
+            if num_starts > 0:
+                best_start_node_local_idx = best_idx % num_starts
+                best_start_node_idx = start_nodes_idx[best_start_node_local_idx].item()
+                best_start_node_name = self.env.generator.config.node_names[best_start_node_idx]
+            else:
+                best_start_node_name = "Unknown"
+
+            # (4) 시각화 파일명 생성 (JSON 파일명 활용)
+            json_name = "custom_problem"
+            if getattr(self.args, 'test_json', None):
+                base_name = os.path.basename(self.args.test_json)
+                json_name = os.path.splitext(base_name)[0]
+            
+            filename_prefix = f"vis_{json_name}"
+            
+            # (5) 시각화 함수 호출 (PNG 저장)
+            self.visualize_result(
+                final_td_instance, 
+                final_cost, 
+                best_start_node_name, 
+                filename_prefix=filename_prefix
+            )
+            
+            self.log("=" * 60)
+            return
         
-        # 1. 테스트 데이터셋 경로 설정 (generate_final_test.py에서 지정한 경로)
+        # [케이스 2] 기존 Clean/Crisis 데이터셋 테스트 (기존 로직 유지)
+        # 1. 테스트 데이터셋 경로 설정
         test_base_path = "test_data"
         test_files = {
             "clean": "test_set_final_1000_clean.pt",
@@ -643,7 +714,6 @@ class PocatTrainer:
             if os.path.exists(path):
                 self.log(f"📂 Loading Test Set [{key.upper()}]: {path}")
                 try:
-                    # CPU로 로드 (평가 시 배치 단위로 GPU 이동)
                     test_datasets[key] = torch.load(path, weights_only=False).to("cpu")
                 except Exception as e:
                     self.log(f"❌ 데이터 로드 실패: {e}")
@@ -654,34 +724,28 @@ class PocatTrainer:
             self.log("❌ 수행할 테스트 데이터가 없습니다. 종료합니다.")
             return
 
-        # 3. 평가 수행 (validate_on_dataset 재사용)
+        # 3. 평가 수행
         results = {}
         self.log("-" * 60)
         
         for name, ds in test_datasets.items():
             self.log(f"🚀 Evaluating {name.upper()} Set ({len(ds)} samples)...")
-            
-            # validate_on_dataset은 배치 처리를 해주므로 대용량 데이터도 OK
             res = self.validate_on_dataset(ds, desc=f"Test-{name}")
             results[name] = res
-            
             self.log(f"   👉 {name.upper()} Result: Avg BOM ${res['avg_bom']:.4f}")
 
-        # 4. 최종 리포트 출력 (논문 Table 작성용)
+        # 4. 최종 리포트
         self.log("=" * 60)
         self.log("📊 [FINAL REPORT] 논문 실험 결과 요약")
-        
         if "clean" in results:
             r = results["clean"]
             self.log(f"✅ Normal Condition (Clean) : Cost ${r['avg_bom']:.4f} | Feasibility {r['feasibility']*100:.1f}%")
-            
         if "crisis" in results:
             r = results["crisis"]
             self.log(f"⚠️ Supply Crisis (Crisis) : Cost ${r['avg_bom']:.4f} | Feasibility {r['feasibility']*100:.1f}%")
-            
         self.log("=" * 60)
         
-        # (옵션) 마지막으로 시각화 하나 남기기
+        # (옵션) 마지막 시각화
         self._run_test_visualization(epoch=9999, is_best=False)
 
     @torch.no_grad()
@@ -765,11 +829,11 @@ class PocatTrainer:
         # 최종적으로 Active 상태인 IC들의 가격 합계
         total_bom_cost = all_nodes[active_nodes_mask & ic_mask, FEATURE_INDEX["cost"]].sum().item()
 
-        # 2. Sleep Penalty 계산 (총비용 - BOM비용)
-        sleep_penalty = max(0.0, final_cost - total_bom_cost)
-
-        self.log(f"추론 완료 (Total: ${final_cost:.4f} | "
-                 f"BOM: ${total_bom_cost:.2f} + Penalty: ${sleep_penalty:.4f}), "
+        # [수정] V9은 Hard Constraint이므로 별도의 Sleep Penalty가 없음.
+        # (final_cost는 WEIGHT_BOM=100 배율이 적용된 점수이므로 시각화 텍스트에서 제외하거나 보정)
+        
+        self.log(f"추론 완료 (Score: {final_cost:.1f} | "
+                 f"Real BOM Cost: ${total_bom_cost:.4f}), "
                  f"Start: '{best_start_node_name}'")
 
         # 7. 시각화 실행 (최종 TD와 계산된 값을 사용)
@@ -1018,12 +1082,9 @@ class PocatTrainer:
             # FEATURE_INDEX["cost"] = 5 (definitions.py 기준)
             node_cost = all_nodes_features[ic_idx, FEATURE_INDEX["cost"]].item()
             total_bom_cost += node_cost
-            
-        sleep_penalty = max(0.0, final_cost - total_bom_cost) # (전체 - BOM = 페널티)
-        
+       
         label_str = (f"Transformer Solution (Start: {best_start_node_name})\\n"
-                     f"Total Cost: ${final_cost:.4f}\\n"
-                     f"(BOM: ${total_bom_cost:.2f} + Penalty: ${sleep_penalty:.4f})")
+                     f"Total BOM Cost: ${total_bom_cost:.4f}")
 
         dot = Digraph(comment=f"Power Tree - Cost ${final_cost:.4f}")
         dot.attr('node', shape='box', style='rounded,filled', fontname='Arial')

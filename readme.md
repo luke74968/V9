@@ -1,12 +1,17 @@
-# V7-Pocat-Solver Readme
+# Pocat-Solver Readme
 
 ## 1. 초기 셋업
-
 # 서버관련 셋업
-
 # 가상환경 생성 (v7_env 라는 이름으로, Python 3.10 버전을 사용)
 conda create -n v7_env python=3.12 -y
 
+# 가상환경 활성화 
+conda activate v7_env
+# (가상환경이 (v7_env) 로 바뀐 것을 확인)
+# PyTorch 설치 (CUDA 12.9 기준) (기타라이브러리 보다 먼저 설치)
+pip3 install torch torchvision --index-url https://download.pytorch.org/whl/cu129
+# 기타 라이브러리 설치 
+pip install -r requirements.lock.txt
 
 # tmux 세션에서 conda 환경 활성화 + 학습 실행
 tmux new -s train_v7
@@ -14,23 +19,18 @@ tmux new -s train_v7
 conda activate v7_env
 cd ~/your_project_path
 
-CUDA_VISIBLE_DEVICES=2,3 torchrun --nproc_per_node=2 -m transformer_solver.run --config_yaml configs/config.yaml --config_file configs/config_TII.json  --log_mode progress
-
 # SSH / VS Code 끊기기 전에 안전하게 빠져나오기
 # Ctrl + b  →  d
 # 다시 접속해서 이어보기
 tmux attach -t train_v7
 
 
-# 가상환경 활성화 
-conda activate v7_env
-# (가상환경이 (v7_env) 로 바뀐 것을 확인)
 
-# PyTorch 설치 (CUDA 12.9 기준) 
-pip3 install torch torchvision --index-url https://download.pytorch.org/whl/cu129
+# 학습코드 
+CUDA_VISIBLE_DEVICES=2,3 torchrun --nproc_per_node=2 -m transformer_solver.run --config_yaml configs/config.yaml --config_file configs/config_TII.json  --log_mode progress
 
-# 기타 라이브러리 설치 
-pip install -r requirements.lock.txt
+
+
 
 
 ## 2. OR-Tools Solver 실행
@@ -76,9 +76,8 @@ torchrun --nproc_per_node=2 -m transformer_solver.run --config_file configs/conf
 torchrun --nproc_per_node=2 -m transformer_solver.run --test_only --config_file configs/config_IEIE.json --config_yaml configs/config.yaml --load_path "result_transformer/2025-1204-110012/best_cost.pth" --batch_size 1 --log_mode detail --decode_type greedy
 
 # 훈련된 모델(.pth)을 사용하여 config_IEIE 문제 풀기 ( 수정 필요 )
-python3 -m transformer_solver.run --test_only --config_file configs/config_IEIE.json --config_yaml configs/config.yaml --log_mode detail --load_path "result_transformer/2025-1113-130542/epoch-25.pth
+python -m transformer_solver.run --test_only --load_path "./result_transformer/2026-0128-200139/epoch-5.pth" --test_json "./validation_data/json_clean/problem_000.json" --config_file "./configs/config_TII.json" --config_yaml "./configs/config.yaml"
 
-torchrun --standalone --nproc_per_node=2 -m transformer_solver.run --config_file configs/config_IEIE.json --config_yaml configs/config.yaml --batch_size 8  --log_mode progress
 
 ### 디버그 (Debug)
 
