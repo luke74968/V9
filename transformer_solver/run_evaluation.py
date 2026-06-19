@@ -7,7 +7,7 @@ from evaluation import PocatEvaluator # 위에서 작성한 클래스
 def run_eval():
     # --- 설정 ---
     DEVICE = "cuda" if torch.cuda.is_available() else "cpu"
-    N_MAX = 1000 # 학습된 모델의 N_MAX와 일치해야 함
+    N_MAX = 400 # 학습된 모델의 N_MAX와 일치해야 함
     BATCH_SIZE = 16
     
     # 경로 설정

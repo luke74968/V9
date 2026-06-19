@@ -499,12 +499,7 @@ class PocatDecoder(nn.Module):
         self.Wk_connect_logit = nn.Linear(embedding_dim, embedding_dim, bias=False)
         self.Wk_spawn_logit = nn.Linear(embedding_dim, embedding_dim, bias=False)
 
-        # --- 4. 4-Heads (q_vec을 입력으로 받음) ---
-        self.value_head = nn.Sequential(
-            nn.Linear(embedding_dim, embedding_dim // 2),
-            nn.ReLU(),
-            nn.Linear(embedding_dim // 2, 1)
-        )
+
         self.type_head = nn.Linear(embedding_dim, 2)
         self.connect_head = nn.Linear(embedding_dim, embedding_dim)
         self.spawn_head = nn.Linear(embedding_dim, embedding_dim)
@@ -536,7 +531,6 @@ class PocatDecoder(nn.Module):
             q_vec = layer(q_vec, k_cache, v_cache)
 
         # --- 3. 최종 결정 (Heads) ---
-        value = self.value_head(q_vec).squeeze(-1)
         logits_action_type = self.type_head(q_vec).squeeze(1)
         
         query_connect = self.connect_head(q_vec) 
@@ -549,7 +543,7 @@ class PocatDecoder(nn.Module):
             query_spawn, cache.logit_key_spawn
         ).squeeze(1) / (self.embedding_dim ** 0.5)
 
-        return logits_action_type, logits_connect_target, logits_spawn_template, value
+        return logits_action_type, logits_connect_target, logits_spawn_template
 
 class PocatModel(nn.Module):
     """
@@ -766,12 +760,8 @@ class PocatModel(nn.Module):
                 pbar.set_description(f"{base_desc} | {status_msg} | Loads {connected}/{sample_num_loads}")
 
             # 1. 디코더 호출 (4개 텐서 반환)
-            logits_type, logits_connect, logits_spawn, value = self.decoder(td, cache)
-            
-            # A2C를 위해 첫 스텝의 Value(가치) 저장
-            if decoding_step == 1:
-                first_value = value.squeeze(-1) # (B * N_loads, 1) -> (B * N_loads)
-            
+            logits_type, logits_connect, logits_spawn = self.decoder(td, cache)
+                       
             # 2. 환경에서 3종 마스크 가져오기
             # (solver_env.py가 반환할 마스크 딕셔너리)
             with torch.no_grad():
@@ -1087,7 +1077,6 @@ class PocatModel(nn.Module):
             "log_likelihood": total_log_likelihood,
             "entropy": avg_entropy, # [추가]
             "actions": actions,  # (디버깅용)
-            "value": first_value,
             "bom_cost": final_bom_cost, # [추가]
             "sleep_cost": final_sleep_cost, # [추가]
         }

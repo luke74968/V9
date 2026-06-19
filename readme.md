@@ -27,7 +27,7 @@ tmux attach -t train_v7
 
 
 # 학습코드 
-CUDA_VISIBLE_DEVICES=2,3 torchrun --nproc_per_node=2 -m transformer_solver.run --config_yaml configs/config.yaml --config_file configs/config_TII.json  --log_mode progress
+CUDA_VISIBLE_DEVICES=1,2,3 torchrun --nproc_per_node=3 -m transformer_solver.run --config_yaml configs/config.yaml --config_file configs/config_TII.json  --log_mode progress
 
 
 
@@ -76,7 +76,8 @@ torchrun --nproc_per_node=2 -m transformer_solver.run --config_file configs/conf
 torchrun --nproc_per_node=2 -m transformer_solver.run --test_only --config_file configs/config_IEIE.json --config_yaml configs/config.yaml --load_path "result_transformer/2025-1204-110012/best_cost.pth" --batch_size 1 --log_mode detail --decode_type greedy
 
 # 훈련된 모델(.pth)을 사용하여 config_IEIE 문제 풀기 ( 수정 필요 )
-python -m transformer_solver.run --test_only --load_path "./result_transformer/2026-0128-200139/epoch-5.pth" --test_json "./validation_data/json_clean/problem_000.json" --config_file "./configs/config_TII.json" --config_yaml "./configs/config.yaml"
+python -m transformer_solver.run --test_only --load_path "./result_transformer/2026-0128-200139/epoch-15.pth" --test_json "./validation_data/json_clean/problem_000.json" --config_yaml "./configs/config.yaml"
+
 
 
 ### 디버그 (Debug)

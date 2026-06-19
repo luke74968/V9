@@ -101,16 +101,6 @@ def main(args):
     # --- 4. PocatTrainer (트레이너) 생성 ---
     trainer = PocatTrainer(args, env, device)
 
-    # --- 5. Critic 사전훈련 (A2C 안정화) ---
-    if args.pretrain_critic:
-        if args.local_rank <= 0: # 0번 프로세스에서만 실행
-            trainer.pretrain_critic(
-                expert_data_path=args.pretrain_critic, 
-                pretrain_epochs=args.pretrain_epochs
-            )
-        if args.ddp:
-            dist.barrier() # 모든 프로세스가 사전훈련 완료까지 대기
-
     # --- 6. 메인 훈련 또는 테스트 실행 ---
     # [추가] 중요 파라미터에 대한 안전한 기본값 처리 (YAML에도 없고 CLI도 없으면 기본값 적용)
     if args.batch_size is None: args.batch_size = 64
@@ -160,11 +150,6 @@ if __name__ == "__main__":
     parser.add_argument("--batch_size", type=int, default=None, help="Training batch_size (per GPU)")
     parser.add_argument("--num_pomo_samples", type=int, default=None, 
                         help="Number of POMO samples. (Matches 'pomo_size' in config)")
-
-    # --- Critic 사전훈련 ---
-    parser.add_argument('--pretrain_critic', type=str, default=None, 
-                        help="Path to expert_data.json for Critic pre-training.")
-    parser.add_argument('--pretrain_epochs', type=int, default=5, help="Number of epochs for Critic pre-training.")    
 
     # --- 추론(Test) / 모델 로드 ---
     parser.add_argument('--test_only', action='store_true', help="Only run test/inference")

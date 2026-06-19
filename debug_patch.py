@@ -109,7 +109,7 @@ PocatEnv._get_thermal_current_mask = patched_get_thermal_current_mask
 if __name__ == "__main__":
     # 설정 파일 경로와 N_max는 필요에 따라 수정하세요
     config_file = "configs/config_TII.json"
-    n_max = 600
+    n_max = 400
     
     print(f"🔧 Debug Patch Loaded (Full Scan Mode). Running Debugger on {config_file}...")
     run_interactive_debugger(config_file, n_max)

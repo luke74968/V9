@@ -120,10 +120,16 @@ class PocatTrainer:
                 
                 # DDP/일반 모델 상태 호환 로드
                 model_to_load = self.model.module if self.is_ddp else self.model
-                model_to_load.load_state_dict(checkpoint['model_state_dict'])
-                
+                model_to_load.load_state_dict(checkpoint['model_state_dict'], strict=False)                
+
                 if not args.test_only: # 훈련 재개 시
-                    self.optimizer.load_state_dict(checkpoint['optimizer_state_dict'])
+                    # [주의] 모델 구조가 바뀌었으므로(파라미터 수 감소), 
+                    # 기존 옵티마이저 상태(Momentum 등)는 호환되지 않습니다.
+                    # 따라서 옵티마이저는 로드하지 않고 새로 초기화하는 것이 안전합니다.
+                    try:
+                        self.optimizer.load_state_dict(checkpoint['optimizer_state_dict'])
+                    except ValueError:
+                        self.log("⚠️ 경고: 모델 구조 변경으로 인해 옵티마이저 상태 로드를 건너뜁니다. (새로운 옵티마이저로 시작)")
                     self.start_epoch = checkpoint['epoch'] + 1
                 self.log("모델 로드 완료.")
             except Exception as e:
@@ -175,93 +181,6 @@ class PocatTrainer:
                 self.val_datasets["crisis"] = load_safe(crisis_path)
             else:
                 self.log(f"⚠️ Crisis Validation 파일을 찾을 수 없음: {crisis_path}")
-
-    def pretrain_critic(self, expert_data_path: str, pretrain_epochs: int = 5):
-        """
-        '정답지(Expert)' 데이터셋을 사용하여 A2C 모델의 Critic(Value Head)만
-        지도학습 방식으로 사전훈련합니다.
-        """
-        args = self.args
-        self.log("=================================================================")
-        self.log(f"🧠 Critic 사전훈련(Pre-training) 시작...")
-        
-        try:
-            expert_dataset = ExpertReplayDataset(
-                expert_data_path=expert_data_path, 
-                env=self.env, 
-                device=self.device
-            )
-            if len(expert_dataset) == 0:
-                self.log("❌ 오류: '정답지' 데이터셋이 비어있어 사전훈련을 건너뜁니다.")
-                return
-            
-            expert_loader = DataLoader(
-                expert_dataset,
-                batch_size=args.batch_size, # 훈련 배치 크기 재사용
-                shuffle=True,
-                num_workers=0,
-                collate_fn=expert_collate_fn # TensorDict용 커스텀 Collate
-            )
-        except Exception as e:
-            self.log(f"❌ 오류: '정답지' 데이터셋 로드 실패: {e}")
-            return
-
-        # Critic 파라미터만 학습하는 별도의 옵티마이저 생성
-        model_to_train = self.model.module if self.is_ddp else self.model
-        critic_params = list(model_to_train.decoder.value_head.parameters()) + \
-                        list(model_to_train.decoder.Wq_context.parameters()) + \
-                        list(model_to_train.decoder.multi_head_combine.parameters())
-                        
-        critic_optimizer = torch.optim.AdamW(
-            critic_params,
-            lr=float(args.optimizer_params['optimizer']['lr'])
-        )
-
-        self.model.train()
-
-        for epoch in range(1, pretrain_epochs + 1):
-            pbar = tqdm(expert_loader, desc=f"Critic Pre-train Epoch {epoch}/{pretrain_epochs}", dynamic_ncols=True)
-            total_v_loss = 0
-            
-            for state_td_batch, target_reward_batch in pbar:
-                critic_optimizer.zero_grad()
-                
-                # (B, 1, ...) -> (B, ...)
-                state_td_batch = state_td_batch.squeeze(1)
-                
-                # --- 모델 인코딩 및 캐시 생성 ---
-                prompt_embedding = model_to_train.prompt_net(
-                    state_td_batch["scalar_prompt_features"], 
-                    state_td_batch["matrix_prompt_features"]
-                )
-                encoded_nodes = model_to_train.encoder(state_td_batch, prompt_embedding)
-                
-                glimpse_key = reshape_by_heads(model_to_train.decoder.Wk_glimpse(encoded_nodes), model_to_train.decoder.head_num)
-                glimpse_val = reshape_by_heads(model_to_train.decoder.Wv_glimpse(encoded_nodes), model_to_train.decoder.head_num)
-                logit_key_connect = model_to_train.decoder.Wk_connect_logit(encoded_nodes).transpose(1, 2)
-                logit_key_spawn = model_to_train.decoder.Wk_spawn_logit(encoded_nodes).transpose(1, 2)
-                
-                cache = PrecomputedCache(
-                    encoded_nodes, glimpse_key, glimpse_val, 
-                    logit_key_connect, logit_key_spawn
-                )
-                
-                # --- 디코더 호출 (Value만 사용) ---
-                _, _, _, predicted_value = model_to_train.decoder(state_td_batch, cache)
-                
-                # V_Loss 계산: Critic의 예측 vs "정답지"의 실제 보상
-                critic_loss = F.mse_loss(predicted_value, target_reward_batch)
-                
-                critic_loss.backward()
-                critic_optimizer.step()
-                
-                total_v_loss += critic_loss.item()
-                pbar.set_postfix({"V_Loss (Pre)": f"{critic_loss.item():.4f}"})
-
-            self.log(f"Critic Pre-train Epoch {epoch} | Avg V_Loss: {total_v_loss / len(expert_loader):.4f}")
-
-        self.log("✅ Critic 사전훈련 완료.")
-        self.log("=================================================================")
 
     def run(self):
         """ 메인 훈련 루프 (A2C) """
@@ -351,11 +270,7 @@ class PocatTrainer:
                         log_idx=args.log_idx, log_mode=args.log_mode,
                         return_final_td=True
                     )
-                
-                # 4. A2C 손실 계산
-                # 기존: reward = out["reward"].view(args.batch_size, pomo_size)
-                # 수정: -1을 사용하여 실제 POMO 개수에 맞게 자동 Reshape
-                
+               
                 # out["reward"] shape: (Batch * Actual_POMO, 1)
                 # -> (Batch, Actual_POMO)
                 reward = out["reward"].view(args.batch_size, -1)
@@ -363,22 +278,6 @@ class PocatTrainer:
                 
                 bom_cost = out["bom_cost"].view(args.batch_size, -1)
                 sleep_cost = out["sleep_cost"].view(args.batch_size, -1)    
-
-
-
-                """
-                Critic 부분 
-                # Critic Loss (V(s)가 실제 보상(G)을 예측하도록)
-                critic_loss = F.mse_loss(value, reward)
-
-                # Policy Loss (Actor)
-                # baseline: (B_origin, 1) -> 각 문제별 (Aug*POMO) 전체 평균
-                advantage = reward - value.detach() # Baseline = V(s)
-                policy_loss = -(advantage * log_likelihood).mean()
-
-                # Total Loss (A2C)
-                loss = policy_loss + 0.5 * critic_loss
-                """
                 
                 # 1. POMO Baseline (현재 배치의 평균)
                 pomo_baseline = reward.mean(dim=1, keepdim=True)
